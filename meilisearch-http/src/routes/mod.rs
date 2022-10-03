@@ -1,28 +1,126 @@
-use std::time::Duration;
-
-use actix_web::{web, HttpResponse};
-use chrono::{DateTime, Utc};
+use actix_web::{web, HttpRequest, HttpResponse};
 use log::debug;
-use meilisearch_lib::index_controller::updates::status::{UpdateResult, UpdateStatus};
 use serde::{Deserialize, Serialize};
 
+use serde_json::json;
+use time::OffsetDateTime;
+
 use meilisearch_lib::index::{Settings, Unchecked};
-use meilisearch_lib::{MeiliSearch, Update};
+use meilisearch_lib::MeiliSearch;
+use meilisearch_types::error::ResponseError;
+use meilisearch_types::star_or::StarOr;
 
-use crate::error::ResponseError;
+use crate::analytics::Analytics;
 use crate::extractors::authentication::{policies::*, GuardedData};
-use crate::ApiKeys;
 
+mod api_key;
 mod dump;
-mod indexes;
+pub mod indexes;
+mod tasks;
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.service(web::resource("/health").route(web::get().to(get_health)))
+    cfg.service(web::scope("/tasks").configure(tasks::configure))
+        .service(web::resource("/health").route(web::get().to(get_health)))
+        .service(web::scope("/keys").configure(api_key::configure))
         .service(web::scope("/dumps").configure(dump::configure))
-        .service(web::resource("/keys").route(web::get().to(list_keys)))
         .service(web::resource("/stats").route(web::get().to(get_stats)))
         .service(web::resource("/version").route(web::get().to(get_version)))
         .service(web::scope("/indexes").configure(indexes::configure));
+}
+
+/// Extracts the raw values from the `StarOr` types and
+/// return None if a `StarOr::Star` is encountered.
+pub fn fold_star_or<T, O>(content: impl IntoIterator<Item = StarOr<T>>) -> Option<O>
+where
+    O: FromIterator<T>,
+{
+    content
+        .into_iter()
+        .map(|value| match value {
+            StarOr::Star => None,
+            StarOr::Other(val) => Some(val),
+        })
+        .collect()
+}
+
+const PAGINATION_DEFAULT_LIMIT: fn() -> usize = || 20;
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Pagination {
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "PAGINATION_DEFAULT_LIMIT")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaginationView<T> {
+    pub results: Vec<T>,
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+}
+
+impl Pagination {
+    /// Given the full data to paginate, returns the selected section.
+    pub fn auto_paginate_sized<T>(
+        self,
+        content: impl IntoIterator<Item = T> + ExactSizeIterator,
+    ) -> PaginationView<T>
+    where
+        T: Serialize,
+    {
+        let total = content.len();
+        let content: Vec<_> = content
+            .into_iter()
+            .skip(self.offset)
+            .take(self.limit)
+            .collect();
+        self.format_with(total, content)
+    }
+
+    /// Given an iterator and the total number of elements, returns the selected section.
+    pub fn auto_paginate_unsized<T>(
+        self,
+        total: usize,
+        content: impl IntoIterator<Item = T>,
+    ) -> PaginationView<T>
+    where
+        T: Serialize,
+    {
+        let content: Vec<_> = content
+            .into_iter()
+            .skip(self.offset)
+            .take(self.limit)
+            .collect();
+        self.format_with(total, content)
+    }
+
+    /// Given the data already paginated + the total number of elements, it stores
+    /// everything in a [PaginationResult].
+    pub fn format_with<T>(self, total: usize, results: Vec<T>) -> PaginationView<T>
+    where
+        T: Serialize,
+    {
+        PaginationView {
+            results,
+            offset: self.offset,
+            limit: self.limit,
+            total,
+        }
+    }
+}
+
+impl<T> PaginationView<T> {
+    pub fn new(offset: usize, limit: usize, total: usize, results: Vec<T>) -> Self {
+        Self {
+            offset,
+            limit,
+            results,
+            total,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,38 +146,6 @@ pub enum UpdateType {
     },
 }
 
-impl From<&UpdateStatus> for UpdateType {
-    fn from(other: &UpdateStatus) -> Self {
-        use meilisearch_lib::milli::update::IndexDocumentsMethod::*;
-        match other.meta() {
-            Update::DocumentAddition { method, .. } => {
-                let number = match other {
-                    UpdateStatus::Processed(processed) => match processed.success {
-                        UpdateResult::DocumentsAddition(ref addition) => {
-                            Some(addition.nb_documents)
-                        }
-                        _ => None,
-                    },
-                    _ => None,
-                };
-
-                match method {
-                    ReplaceDocuments => UpdateType::DocumentsAddition { number },
-                    UpdateDocuments => UpdateType::DocumentsPartial { number },
-                    _ => unreachable!(),
-                }
-            }
-            Update::Settings(settings) => UpdateType::Settings {
-                settings: settings.clone(),
-            },
-            Update::ClearDocuments => UpdateType::ClearAll,
-            Update::DeleteDocuments(ids) => UpdateType::DocumentsDeletion {
-                number: Some(ids.len()),
-            },
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessedUpdateResult {
@@ -87,8 +153,10 @@ pub struct ProcessedUpdateResult {
     #[serde(rename = "type")]
     pub update_type: UpdateType,
     pub duration: f64, // in seconds
-    pub enqueued_at: DateTime<Utc>,
-    pub processed_at: DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub enqueued_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub processed_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,11 +165,12 @@ pub struct FailedUpdateResult {
     pub update_id: u64,
     #[serde(rename = "type")]
     pub update_type: UpdateType,
-    #[serde(flatten)]
-    pub response: ResponseError,
+    pub error: ResponseError,
     pub duration: f64, // in seconds
-    pub enqueued_at: DateTime<Utc>,
-    pub processed_at: DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub enqueued_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub processed_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,9 +179,13 @@ pub struct EnqueuedUpdateResult {
     pub update_id: u64,
     #[serde(rename = "type")]
     pub update_type: UpdateType,
-    pub enqueued_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub started_processing_at: Option<DateTime<Utc>>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub enqueued_at: OffsetDateTime,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub started_processing_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,81 +209,6 @@ pub enum UpdateStatusResponse {
     },
 }
 
-impl From<UpdateStatus> for UpdateStatusResponse {
-    fn from(other: UpdateStatus) -> Self {
-        let update_type = UpdateType::from(&other);
-
-        match other {
-            UpdateStatus::Processing(processing) => {
-                let content = EnqueuedUpdateResult {
-                    update_id: processing.id(),
-                    update_type,
-                    enqueued_at: processing.from.enqueued_at,
-                    started_processing_at: Some(processing.started_processing_at),
-                };
-                UpdateStatusResponse::Processing { content }
-            }
-            UpdateStatus::Enqueued(enqueued) => {
-                let content = EnqueuedUpdateResult {
-                    update_id: enqueued.id(),
-                    update_type,
-                    enqueued_at: enqueued.enqueued_at,
-                    started_processing_at: None,
-                };
-                UpdateStatusResponse::Enqueued { content }
-            }
-            UpdateStatus::Processed(processed) => {
-                let duration = processed
-                    .processed_at
-                    .signed_duration_since(processed.from.started_processing_at)
-                    .num_milliseconds();
-
-                // necessary since chrono::duration don't expose a f64 secs method.
-                let duration = Duration::from_millis(duration as u64).as_secs_f64();
-
-                let content = ProcessedUpdateResult {
-                    update_id: processed.id(),
-                    update_type,
-                    duration,
-                    enqueued_at: processed.from.from.enqueued_at,
-                    processed_at: processed.processed_at,
-                };
-                UpdateStatusResponse::Processed { content }
-            }
-            UpdateStatus::Aborted(_) => unreachable!(),
-            UpdateStatus::Failed(failed) => {
-                let duration = failed
-                    .failed_at
-                    .signed_duration_since(failed.from.started_processing_at)
-                    .num_milliseconds();
-
-                // necessary since chrono::duration don't expose a f64 secs method.
-                let duration = Duration::from_millis(duration as u64).as_secs_f64();
-
-                let update_id = failed.id();
-                let processed_at = failed.failed_at;
-                let enqueued_at = failed.from.from.enqueued_at;
-                let response = failed.into();
-
-                let content = FailedUpdateResult {
-                    update_id,
-                    update_type,
-                    response,
-                    duration,
-                    enqueued_at,
-                    processed_at,
-                };
-                UpdateStatusResponse::Failed { content }
-            }
-        }
-    }
-}
-
-#[derive(Deserialize)]
-pub struct IndexParam {
-    index_uid: String,
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexUpdateResponse {
@@ -230,13 +228,21 @@ impl IndexUpdateResponse {
 /// }
 /// ```
 pub async fn running() -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({ "status": "MeiliSearch is running" }))
+    HttpResponse::Ok().json(serde_json::json!({ "status": "Meilisearch is running" }))
 }
 
 async fn get_stats(
-    meilisearch: GuardedData<Private, MeiliSearch>,
+    meilisearch: GuardedData<ActionPolicy<{ actions::STATS_GET }>, MeiliSearch>,
+    req: HttpRequest,
+    analytics: web::Data<dyn Analytics>,
 ) -> Result<HttpResponse, ResponseError> {
-    let response = meilisearch.get_all_stats().await?;
+    analytics.publish(
+        "Stats Seen".to_string(),
+        json!({ "per_index_uid": false }),
+        Some(&req),
+    );
+    let search_rules = &meilisearch.filters().search_rules;
+    let response = meilisearch.get_all_stats(search_rules).await?;
 
     debug!("returns: {:?}", response);
     Ok(HttpResponse::Ok().json(response))
@@ -250,7 +256,9 @@ struct VersionResponse {
     pkg_version: String,
 }
 
-async fn get_version(_meilisearch: GuardedData<Private, MeiliSearch>) -> HttpResponse {
+async fn get_version(
+    _meilisearch: GuardedData<ActionPolicy<{ actions::VERSION }>, MeiliSearch>,
+) -> HttpResponse {
     let commit_sha = option_env!("VERGEN_GIT_SHA").unwrap_or("unknown");
     let commit_date = option_env!("VERGEN_GIT_COMMIT_TIMESTAMP").unwrap_or("unknown");
 
@@ -267,107 +275,6 @@ struct KeysResponse {
     public: Option<String>,
 }
 
-pub async fn list_keys(meilisearch: GuardedData<Admin, ApiKeys>) -> HttpResponse {
-    let api_keys = (*meilisearch).clone();
-    HttpResponse::Ok().json(&KeysResponse {
-        private: api_keys.private,
-        public: api_keys.public,
-    })
-}
-
 pub async fn get_health() -> Result<HttpResponse, ResponseError> {
     Ok(HttpResponse::Ok().json(serde_json::json!({ "status": "available" })))
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::extractors::authentication::GuardedData;
-
-    /// A type implemented for a route that uses a authentication policy `Policy`.
-    ///
-    /// This trait is used for regression testing of route authenticaton policies.
-    trait Is<Policy, Data, T> {}
-
-    macro_rules! impl_is_policy {
-        ($($param:ident)*) => {
-            impl<Policy, Func, Data, $($param,)* Res> Is<Policy, Data, (($($param,)*), Res)> for Func
-                where Func: Fn(GuardedData<Policy, Data>, $($param,)*) -> Res {}
-
-        };
-    }
-
-    impl_is_policy! {}
-    impl_is_policy! {A}
-    impl_is_policy! {A B}
-    impl_is_policy! {A B C}
-    impl_is_policy! {A B C D}
-
-    /// Emits a compile error if a route doesn't have the correct authentication policy.
-    ///
-    /// This works by trying to cast the route function into a Is<Policy, _> type, where Policy it
-    /// the authentication policy defined for the route.
-    macro_rules! test_auth_routes {
-        ($($policy:ident => { $($route:expr,)*})*) => {
-            #[test]
-            fn test_auth() {
-                $($(let _: &dyn Is<$policy, _, _> = &$route;)*)*
-            }
-        };
-    }
-
-    test_auth_routes! {
-        Public => {
-            indexes::search::search_with_url_query,
-            indexes::search::search_with_post,
-
-            indexes::documents::get_document,
-            indexes::documents::get_all_documents,
-        }
-        Private => {
-            get_stats,
-            get_version,
-
-            indexes::create_index,
-            indexes::list_indexes,
-            indexes::get_index_stats,
-            indexes::delete_index,
-            indexes::update_index,
-            indexes::get_index,
-
-            dump::create_dump,
-
-            indexes::settings::filterable_attributes::get,
-            indexes::settings::displayed_attributes::get,
-            indexes::settings::searchable_attributes::get,
-            indexes::settings::stop_words::get,
-            indexes::settings::synonyms::get,
-            indexes::settings::distinct_attribute::get,
-            indexes::settings::filterable_attributes::update,
-            indexes::settings::displayed_attributes::update,
-            indexes::settings::searchable_attributes::update,
-            indexes::settings::stop_words::update,
-            indexes::settings::synonyms::update,
-            indexes::settings::distinct_attribute::update,
-            indexes::settings::filterable_attributes::delete,
-            indexes::settings::displayed_attributes::delete,
-            indexes::settings::searchable_attributes::delete,
-            indexes::settings::stop_words::delete,
-            indexes::settings::synonyms::delete,
-            indexes::settings::distinct_attribute::delete,
-            indexes::settings::delete_all,
-            indexes::settings::get_all,
-            indexes::settings::update_all,
-
-            indexes::documents::clear_all_documents,
-            indexes::documents::delete_documents,
-            indexes::documents::update_documents,
-            indexes::documents::add_documents,
-            indexes::documents::delete_document,
-
-            indexes::updates::get_all_updates_status,
-            indexes::updates::get_update_status,
-        }
-        Admin => { list_keys, }
-    }
 }

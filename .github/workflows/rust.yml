@@ -11,6 +11,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: "-D warnings"
 
 jobs:
   tests:
@@ -19,11 +21,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-18.04, macos-latest, windows-latest]
+        os: [ubuntu-20.04, macos-latest, windows-latest]
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Cache dependencies
-      uses: Swatinem/rust-cache@v1.3.0
+      uses: Swatinem/rust-cache@v2.0.0
     - name: Run cargo check without any default features
       uses: actions-rs/cargo@v1
       with:
@@ -35,11 +37,30 @@ jobs:
         command: test
         args: --locked --release
 
+  # We run tests in debug also, to make sure that the debug_assertions are hit
+  test-debug:
+    name: Run tests in debug
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2.0.0
+      - name: Run tests in debug
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --locked
+
   clippy:
     name: Run Clippy
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -47,7 +68,7 @@ jobs:
           override: true
           components: clippy
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v1.3.0
+        uses: Swatinem/rust-cache@v2.0.0
       - name: Run cargo clippy
         uses: actions-rs/cargo@v1
         with:
@@ -56,16 +77,16 @@ jobs:
 
   fmt:
     name: Run Rustfmt
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: nightly
+          toolchain: stable
           override: true
           components: rustfmt
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v1.3.0
+        uses: Swatinem/rust-cache@v2.0.0
       - name: Run cargo fmt
         run: cargo fmt --all -- --check

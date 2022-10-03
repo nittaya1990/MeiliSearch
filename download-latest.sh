@@ -51,13 +51,13 @@ semverLT() {
     if [ $MAJOR_A -le $MAJOR_B ] && [ $MINOR_A -le $MINOR_B ] && [ $PATCH_A -lt $PATCH_B ]; then
         return 0
     fi
-    if [ "_$SPECIAL_A"  == "_" ] && [ "_$SPECIAL_B"  == "_" ] ; then
+    if [ "_$SPECIAL_A"  == '_' ] && [ "_$SPECIAL_B"  == '_' ] ; then
         return 1
     fi
-    if [ "_$SPECIAL_A"  == "_" ] && [ "_$SPECIAL_B"  != "_" ] ; then
+    if [ "_$SPECIAL_A"  == '_' ] && [ "_$SPECIAL_B"  != '_' ] ; then
         return 1
     fi
-    if [ "_$SPECIAL_A"  != "_" ] && [ "_$SPECIAL_B"  == "_" ] ; then
+    if [ "_$SPECIAL_A"  != '_' ] && [ "_$SPECIAL_B"  == '_' ] ; then
         return 0
     fi
     if [ "_$SPECIAL_A" < "_$SPECIAL_B" ]; then
@@ -67,39 +67,47 @@ semverLT() {
     return 1
 }
 
+# Get a token from https://github.com/settings/tokens to increase rate limit (from 60 to 5000), make sure the token scope is set to 'public_repo'
+# Create GITHUB_PAT environment variable once you acquired the token to start using it
 # Returns the tag of the latest stable release (in terms of semver and not of release date)
 get_latest() {
     temp_file='temp_file' # temp_file needed because the grep would start before the download is over
-    curl -s 'https://api.github.com/repos/meilisearch/MeiliSearch/releases' > "$temp_file" || return 1
+
+    if [ -z "$GITHUB_PAT" ]; then
+        curl -s 'https://api.github.com/repos/meilisearch/meilisearch/releases' > "$temp_file" || return 1
+    else
+        curl -H "Authorization: token $GITHUB_PAT" -s 'https://api.github.com/repos/meilisearch/meilisearch/releases' > "$temp_file" || return 1
+    fi
+
     releases=$(cat "$temp_file" | \
-        grep -E "tag_name|draft|prerelease" \
+        grep -E '"tag_name":|"draft":|"prerelease":' \
         | tr -d ',"' | cut -d ':' -f2 | tr -d ' ')
         # Returns a list of [tag_name draft_boolean prerelease_boolean ...]
         # Ex: v0.10.1 false false v0.9.1-rc.1 false true v0.9.0 false false...
 
     i=0
-    latest=""
-    current_tag=""
+    latest=''
+    current_tag=''
     for release_info in $releases; do
-        if [ $i -eq 0 ]; then # Cheking tag_name
+        if [ $i -eq 0 ]; then # Checking tag_name
             if echo "$release_info" | grep -q "$GREP_SEMVER_REGEXP"; then # If it's not an alpha or beta release
                 current_tag=$release_info
             else
-                current_tag=""
+                current_tag=''
             fi
             i=1
         elif [ $i -eq 1 ]; then # Checking draft boolean
-            if [ "$release_info" = "true" ]; then
-                current_tag=""
+            if [ "$release_info" = 'true' ]; then
+                current_tag=''
             fi
             i=2
         elif [ $i -eq 2 ]; then # Checking prerelease boolean
-            if [ "$release_info" = "true" ]; then
-                current_tag=""
+            if [ "$release_info" = 'true' ]; then
+                current_tag=''
             fi
             i=0
-            if [ "$current_tag" != "" ]; then # If the current_tag is valid
-                if [ "$latest" = "" ]; then # If there is no latest yet
+            if [ "$current_tag" != '' ]; then # If the current_tag is valid
+                if [ "$latest" = '' ]; then # If there is no latest yet
                     latest="$current_tag"
                 else
                     semverLT $current_tag $latest # Comparing latest and the current tag
@@ -112,7 +120,7 @@ get_latest() {
     done
 
     rm -f "$temp_file"
-    echo $latest
+    return 0
 }
 
 # Gets the OS by setting the $os variable
@@ -140,11 +148,18 @@ get_os() {
 get_archi() {
     architecture=$(uname -m)
     case "$architecture" in
-    'x86_64' | 'amd64' | 'arm64')
+    'x86_64' | 'amd64' )
         archi='amd64'
         ;;
+    'arm64')
+        if [ $os = 'macos' ]; then # MacOS M1
+            archi='amd64'
+        else
+            archi='aarch64'
+        fi
+        ;;
     'aarch64')
-        archi='armv8'
+        archi='aarch64'
         ;;
     *)
         return 1
@@ -153,7 +168,7 @@ get_archi() {
 }
 
 success_usage() {
-    printf "$GREEN%s\n$DEFAULT" "MeiliSearch binary successfully downloaded as '$BINARY_NAME' file."
+    printf "$GREEN%s\n$DEFAULT" "Meilisearch $latest binary successfully downloaded as '$binary_name' file."
     echo ''
     echo 'Run it:'
     echo '    $ ./meilisearch'
@@ -161,40 +176,65 @@ success_usage() {
     echo '    $ ./meilisearch --help'
 }
 
-failure_usage() {
-    printf "$RED%s\n$DEFAULT" 'ERROR: MeiliSearch binary is not available for your OS distribution or your architecture yet.'
+not_available_failure_usage() {
+    printf "$RED%s\n$DEFAULT" 'ERROR: Meilisearch binary is not available for your OS distribution or your architecture yet.'
     echo ''
     echo 'However, you can easily compile the binary from the source files.'
     echo 'Follow the steps at the page ("Source" tab): https://docs.meilisearch.com/learn/getting_started/installation.html'
 }
 
+fetch_release_failure_usage() {
+    echo ''
+    printf "$RED%s\n$DEFAULT" 'ERROR: Impossible to get the latest stable version of Meilisearch.'
+    echo 'Please let us know about this issue: https://github.com/meilisearch/meilisearch/issues/new/choose'
+}
+
 # MAIN
-latest="$(get_latest)"
 
+# Fill $latest variable
+if ! get_latest; then
+    fetch_release_failure_usage # TO CHANGE
+    exit 1
+fi
+
+if [ "$latest" = '' ]; then
+    fetch_release_failure_usage
+    exit 1
+fi
+
+# Fill $os variable
 if ! get_os; then
-    failure_usage
+    not_available_failure_usage
     exit 1
 fi
 
+# Fill $archi variable
 if ! get_archi; then
-    failure_usage
+    not_available_failure_usage
     exit 1
 fi
 
-echo "Downloading MeiliSearch binary $latest for $os, architecture $archi..."
+echo "Downloading Meilisearch binary $latest for $os, architecture $archi..."
 case "$os" in
     'windows')
         release_file="meilisearch-$os-$archi.exe"
-		BINARY_NAME='meilisearch.exe'
+        binary_name='meilisearch.exe'
 
         ;;
-	*)
-		release_file="meilisearch-$os-$archi"
-		BINARY_NAME='meilisearch'
+    *)
+        release_file="meilisearch-$os-$archi"
+        binary_name='meilisearch'
 
 esac
-link="https://github.com/meilisearch/MeiliSearch/releases/download/$latest/$release_file"
-curl -OL "$link"
-mv "$release_file" "$BINARY_NAME"
-chmod 744 "$BINARY_NAME"
+
+# Fetch the Meilisearch binary
+link="https://github.com/meilisearch/meilisearch/releases/download/$latest/$release_file"
+curl --fail -OL "$link"
+if [ $? -ne 0 ]; then
+    fetch_release_failure_usage
+    exit 1
+fi
+
+mv "$release_file" "$binary_name"
+chmod 744 "$binary_name"
 success_usage

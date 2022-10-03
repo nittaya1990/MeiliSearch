@@ -1,24 +1,25 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::fs::create_dir_all;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
-use heed::{EnvOpenOptions, RoTxn};
-use milli::update::Setting;
-use milli::{obkv_to_json, FieldDistribution, FieldId};
+use fst::IntoStreamer;
+use milli::heed::{CompactionOption, EnvOpenOptions, RoTxn};
+use milli::update::{IndexerConfig, Setting};
+use milli::{obkv_to_json, FieldDistribution, DEFAULT_VALUES_PER_FACET};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use time::OffsetDateTime;
 use uuid::Uuid;
+use walkdir::WalkDir;
 
-use crate::index_controller::update_file_store::UpdateFileStore;
-use crate::EnvSizer;
+use crate::index::search::DEFAULT_PAGINATION_MAX_TOTAL_HITS;
 
 use super::error::IndexError;
 use super::error::Result;
-use super::update_handler::UpdateHandler;
+use super::updates::{FacetingSettings, MinWordSizeTyposSetting, PaginationSettings, TypoSettings};
 use super::{Checked, Settings};
 
 pub type Document = Map<String, Value>;
@@ -26,8 +27,10 @@ pub type Document = Map<String, Value>;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexMeta {
-    created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
     pub primary_key: Option<String>,
 }
 
@@ -37,7 +40,7 @@ impl IndexMeta {
         Self::new_txn(index, &txn)
     }
 
-    pub fn new_txn(index: &Index, txn: &heed::RoTxn) -> Result<Self> {
+    pub fn new_txn(index: &Index, txn: &milli::heed::RoTxn) -> Result<Self> {
         let created_at = index.created_at(txn)?;
         let updated_at = index.updated_at(txn)?;
         let primary_key = index.primary_key(txn)?.map(String::from);
@@ -69,9 +72,7 @@ pub struct Index {
     #[derivative(Debug = "ignore")]
     pub inner: Arc<milli::Index>,
     #[derivative(Debug = "ignore")]
-    pub update_file_store: Arc<UpdateFileStore>,
-    #[derivative(Debug = "ignore")]
-    pub update_handler: Arc<UpdateHandler>,
+    pub indexer_config: Arc<IndexerConfig>,
 }
 
 impl Deref for Index {
@@ -86,24 +87,24 @@ impl Index {
     pub fn open(
         path: impl AsRef<Path>,
         size: usize,
-        update_file_store: Arc<UpdateFileStore>,
         uuid: Uuid,
-        update_handler: Arc<UpdateHandler>,
+        update_handler: Arc<IndexerConfig>,
     ) -> Result<Self> {
+        log::debug!("opening index in {}", path.as_ref().display());
         create_dir_all(&path)?;
         let mut options = EnvOpenOptions::new();
         options.map_size(size);
         let inner = Arc::new(milli::Index::new(options, &path)?);
         Ok(Index {
             inner,
-            update_file_store,
             uuid,
-            update_handler,
+            indexer_config: update_handler,
         })
     }
 
-    pub fn inner(&self) -> &milli::Index {
-        &self.inner
+    /// Asynchronously close the underlying index
+    pub fn close(self) {
+        self.inner.as_ref().clone().prepare_for_closing();
     }
 
     pub fn stats(&self) -> Result<IndexStats> {
@@ -135,7 +136,7 @@ impl Index {
             .map(|fields| fields.into_iter().map(String::from).collect());
 
         let searchable_attributes = self
-            .searchable_fields(txn)?
+            .user_defined_searchable_fields(txn)?
             .map(|fields| fields.into_iter().map(String::from).collect());
 
         let filterable_attributes = self.filterable_fields(txn)?.into_iter().collect();
@@ -154,7 +155,7 @@ impl Index {
                 Ok(stop_words.stream().into_strs()?.into_iter().collect())
             })
             .transpose()?
-            .unwrap_or_else(BTreeSet::new);
+            .unwrap_or_default();
         let distinct_field = self.distinct_field(txn)?.map(String::from);
 
         // in milli each word in the synonyms map were split on their separator. Since we lost
@@ -169,6 +170,43 @@ impl Index {
                 )
             })
             .collect();
+
+        let min_typo_word_len = MinWordSizeTyposSetting {
+            one_typo: Setting::Set(self.min_word_len_one_typo(txn)?),
+            two_typos: Setting::Set(self.min_word_len_two_typos(txn)?),
+        };
+
+        let disabled_words = match self.exact_words(txn)? {
+            Some(fst) => fst.into_stream().into_strs()?.into_iter().collect(),
+            None => BTreeSet::new(),
+        };
+
+        let disabled_attributes = self
+            .exact_attributes(txn)?
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let typo_tolerance = TypoSettings {
+            enabled: Setting::Set(self.authorize_typos(txn)?),
+            min_word_size_for_typos: Setting::Set(min_typo_word_len),
+            disable_on_words: Setting::Set(disabled_words),
+            disable_on_attributes: Setting::Set(disabled_attributes),
+        };
+
+        let faceting = FacetingSettings {
+            max_values_per_facet: Setting::Set(
+                self.max_values_per_facet(txn)?
+                    .unwrap_or(DEFAULT_VALUES_PER_FACET),
+            ),
+        };
+
+        let pagination = PaginationSettings {
+            max_total_hits: Setting::Set(
+                self.pagination_max_total_hits(txn)?
+                    .unwrap_or(DEFAULT_PAGINATION_MAX_TOTAL_HITS),
+            ),
+        };
 
         Ok(Settings {
             displayed_attributes: match displayed_attributes {
@@ -188,46 +226,53 @@ impl Index {
                 None => Setting::Reset,
             },
             synonyms: Setting::Set(synonyms),
+            typo_tolerance: Setting::Set(typo_tolerance),
+            faceting: Setting::Set(faceting),
+            pagination: Setting::Set(pagination),
             _kind: PhantomData,
         })
     }
 
+    /// Return the total number of documents contained in the index + the selected documents.
     pub fn retrieve_documents<S: AsRef<str>>(
         &self,
         offset: usize,
         limit: usize,
         attributes_to_retrieve: Option<Vec<S>>,
-    ) -> Result<Vec<Map<String, Value>>> {
+    ) -> Result<(u64, Vec<Document>)> {
         let txn = self.read_txn()?;
 
         let fields_ids_map = self.fields_ids_map(&txn)?;
-        let fields_to_display =
-            self.fields_to_display(&txn, &attributes_to_retrieve, &fields_ids_map)?;
-
-        let iter = self.documents.range(&txn, &(..))?.skip(offset).take(limit);
+        let all_fields: Vec<_> = fields_ids_map.iter().map(|(id, _)| id).collect();
 
         let mut documents = Vec::new();
-
-        for entry in iter {
+        for entry in self.all_documents(&txn)?.skip(offset).take(limit) {
             let (_id, obkv) = entry?;
-            let object = obkv_to_json(&fields_to_display, &fields_ids_map, obkv)?;
-            documents.push(object);
+            let document = obkv_to_json(&all_fields, &fields_ids_map, obkv)?;
+            let document = match &attributes_to_retrieve {
+                Some(attributes_to_retrieve) => permissive_json_pointer::select_values(
+                    &document,
+                    attributes_to_retrieve.iter().map(|s| s.as_ref()),
+                ),
+                None => document,
+            };
+            documents.push(document);
         }
 
-        Ok(documents)
+        let number_of_documents = self.number_of_documents(&txn)?;
+
+        Ok((number_of_documents, documents))
     }
 
     pub fn retrieve_document<S: AsRef<str>>(
         &self,
         doc_id: String,
         attributes_to_retrieve: Option<Vec<S>>,
-    ) -> Result<Map<String, Value>> {
+    ) -> Result<Document> {
         let txn = self.read_txn()?;
 
         let fields_ids_map = self.fields_ids_map(&txn)?;
-
-        let fields_to_display =
-            self.fields_to_display(&txn, &attributes_to_retrieve, &fields_ids_map)?;
+        let all_fields: Vec<_> = fields_ids_map.iter().map(|(id, _)| id).collect();
 
         let internal_id = self
             .external_documents_ids(&txn)?
@@ -241,36 +286,25 @@ impl Index {
             .map(|(_, d)| d)
             .ok_or(IndexError::DocumentNotFound(doc_id))?;
 
-        let document = obkv_to_json(&fields_to_display, &fields_ids_map, document)?;
+        let document = obkv_to_json(&all_fields, &fields_ids_map, document)?;
+        let document = match &attributes_to_retrieve {
+            Some(attributes_to_retrieve) => permissive_json_pointer::select_values(
+                &document,
+                attributes_to_retrieve.iter().map(|s| s.as_ref()),
+            ),
+            None => document,
+        };
 
         Ok(document)
     }
 
     pub fn size(&self) -> u64 {
-        self.env.size()
-    }
-
-    fn fields_to_display<S: AsRef<str>>(
-        &self,
-        txn: &heed::RoTxn,
-        attributes_to_retrieve: &Option<Vec<S>>,
-        fields_ids_map: &milli::FieldsIdsMap,
-    ) -> Result<Vec<FieldId>> {
-        let mut displayed_fields_ids = match self.displayed_fields_ids(txn)? {
-            Some(ids) => ids.into_iter().collect::<Vec<_>>(),
-            None => fields_ids_map.iter().map(|(id, _)| id).collect(),
-        };
-
-        let attributes_to_retrieve_ids = match attributes_to_retrieve {
-            Some(attrs) => attrs
-                .iter()
-                .filter_map(|f| fields_ids_map.id(f.as_ref()))
-                .collect::<HashSet<_>>(),
-            None => fields_ids_map.iter().map(|(id, _)| id).collect(),
-        };
-
-        displayed_fields_ids.retain(|fid| attributes_to_retrieve_ids.contains(fid));
-        Ok(displayed_fields_ids)
+        WalkDir::new(self.path())
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .fold(0, |acc, m| acc + m.len())
     }
 
     pub fn snapshot(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -278,9 +312,21 @@ impl Index {
         create_dir_all(&dst)?;
         dst.push("data.mdb");
         let _txn = self.write_txn()?;
-        self.inner
-            .env
-            .copy_to_path(dst, heed::CompactionOption::Enabled)?;
+        self.inner.copy_to_path(dst, CompactionOption::Enabled)?;
         Ok(())
+    }
+}
+
+/// When running tests, when a server instance is dropped, the environment is not actually closed,
+/// leaving a lot of open file descriptors.
+impl Drop for Index {
+    fn drop(&mut self) {
+        // When dropping the last instance of an index, we want to close the index
+        // Note that the close is actually performed only if all the instances a effectively
+        // dropped
+
+        if Arc::strong_count(&self.inner) == 1 {
+            self.inner.as_ref().clone().prepare_for_closing();
+        }
     }
 }

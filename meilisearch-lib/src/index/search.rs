@@ -1,12 +1,14 @@
+use std::cmp::min;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str::FromStr;
 use std::time::Instant;
 
 use either::Either;
-use heed::RoTxn;
-use indexmap::IndexMap;
-use meilisearch_tokenizer::{Analyzer, AnalyzerConfig, Token};
-use milli::{AscDesc, FieldId, FieldsIdsMap, FilterCondition, MatchingWords, SortError};
+use milli::tokenizer::TokenizerBuilder;
+use milli::{
+    AscDesc, FieldId, FieldsIdsMap, Filter, FormatOptions, MatchBounds, MatcherBuilder, SortError,
+    TermsMatchingStrategy, DEFAULT_VALUES_PER_FACET,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -16,43 +18,69 @@ use crate::index::error::FacetError;
 use super::error::{IndexError, Result};
 use super::index::Index;
 
-pub type Document = IndexMap<String, Value>;
-type MatchesInfo = BTreeMap<String, Vec<MatchInfo>>;
+pub type Document = serde_json::Map<String, Value>;
+type MatchesPosition = BTreeMap<String, Vec<MatchBounds>>;
 
-#[derive(Serialize, Debug, Clone, PartialEq)]
-pub struct MatchInfo {
-    start: usize,
-    length: usize,
-}
+pub const DEFAULT_SEARCH_LIMIT: fn() -> usize = || 20;
+pub const DEFAULT_CROP_LENGTH: fn() -> usize = || 10;
+pub const DEFAULT_CROP_MARKER: fn() -> String = || "…".to_string();
+pub const DEFAULT_HIGHLIGHT_PRE_TAG: fn() -> String = || "<em>".to_string();
+pub const DEFAULT_HIGHLIGHT_POST_TAG: fn() -> String = || "</em>".to_string();
 
-pub const DEFAULT_SEARCH_LIMIT: usize = 20;
-const fn default_search_limit() -> usize {
-    DEFAULT_SEARCH_LIMIT
-}
+/// The maximum number of results that the engine
+/// will be able to return in one search call.
+pub const DEFAULT_PAGINATION_MAX_TOTAL_HITS: usize = 1000;
 
-pub const DEFAULT_CROP_LENGTH: usize = 200;
-pub const fn default_crop_length() -> usize {
-    DEFAULT_CROP_LENGTH
-}
-
-#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchQuery {
     pub q: Option<String>,
     pub offset: Option<usize>,
-    #[serde(default = "default_search_limit")]
+    #[serde(default = "DEFAULT_SEARCH_LIMIT")]
     pub limit: usize,
     pub attributes_to_retrieve: Option<BTreeSet<String>>,
     pub attributes_to_crop: Option<Vec<String>>,
-    #[serde(default = "default_crop_length")]
+    #[serde(default = "DEFAULT_CROP_LENGTH")]
     pub crop_length: usize,
     pub attributes_to_highlight: Option<HashSet<String>>,
     // Default to false
     #[serde(default = "Default::default")]
-    pub matches: bool,
+    pub show_matches_position: bool,
     pub filter: Option<Value>,
     pub sort: Option<Vec<String>>,
-    pub facets_distribution: Option<Vec<String>>,
+    pub facets: Option<Vec<String>>,
+    #[serde(default = "DEFAULT_HIGHLIGHT_PRE_TAG")]
+    pub highlight_pre_tag: String,
+    #[serde(default = "DEFAULT_HIGHLIGHT_POST_TAG")]
+    pub highlight_post_tag: String,
+    #[serde(default = "DEFAULT_CROP_MARKER")]
+    pub crop_marker: String,
+    #[serde(default)]
+    pub matching_strategy: MatchingStrategy,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MatchingStrategy {
+    /// Remove query words from last to first
+    Last,
+    /// All query words are mandatory
+    All,
+}
+
+impl Default for MatchingStrategy {
+    fn default() -> Self {
+        Self::Last
+    }
+}
+
+impl From<MatchingStrategy> for TermsMatchingStrategy {
+    fn from(other: MatchingStrategy) -> Self {
+        match other {
+            MatchingStrategy::Last => Self::Last,
+            MatchingStrategy::All => Self::All,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -61,30 +89,21 @@ pub struct SearchHit {
     pub document: Document,
     #[serde(rename = "_formatted", skip_serializing_if = "Document::is_empty")]
     pub formatted: Document,
-    #[serde(rename = "_matchesInfo", skip_serializing_if = "Option::is_none")]
-    pub matches_info: Option<MatchesInfo>,
+    #[serde(rename = "_matchesPosition", skip_serializing_if = "Option::is_none")]
+    pub matches_position: Option<MatchesPosition>,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult {
     pub hits: Vec<SearchHit>,
-    pub nb_hits: u64,
-    pub exhaustive_nb_hits: bool,
+    pub estimated_total_hits: u64,
     pub query: String,
     pub limit: usize,
     pub offset: usize,
     pub processing_time_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub facets_distribution: Option<BTreeMap<String, BTreeMap<String, u64>>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exhaustive_facets_count: Option<bool>,
-}
-
-#[derive(Copy, Clone)]
-struct FormatOptions {
-    highlight: bool,
-    crop: Option<usize>,
+    pub facet_distribution: Option<BTreeMap<String, BTreeMap<String, u64>>>,
 }
 
 impl Index {
@@ -98,11 +117,22 @@ impl Index {
             search.query(query);
         }
 
-        search.limit(query.limit);
-        search.offset(query.offset.unwrap_or_default());
+        search.terms_matching_strategy(query.matching_strategy.into());
+
+        let max_total_hits = self
+            .pagination_max_total_hits(&rtxn)?
+            .unwrap_or(DEFAULT_PAGINATION_MAX_TOTAL_HITS);
+
+        // Make sure that a user can't get more documents than the hard limit,
+        // we align that on the offset too.
+        let offset = min(query.offset.unwrap_or(0), max_total_hits);
+        let limit = min(query.limit, max_total_hits.saturating_sub(offset));
+
+        search.offset(offset);
+        search.limit(limit);
 
         if let Some(ref filter) = query.filter {
-            if let Some(facets) = parse_filter(filter, self, &rtxn)? {
+            if let Some(facets) = parse_filter(filter)? {
                 search.filter(facets);
             }
         }
@@ -178,30 +208,35 @@ impl Index {
             &displayed_ids,
         );
 
-        let stop_words = fst::Set::default();
-        let mut config = AnalyzerConfig::default();
-        config.stop_words(&stop_words);
-        let analyzer = Analyzer::new(config);
+        let tokenizer = TokenizerBuilder::default().build();
 
-        let formatter = Formatter::new(&analyzer, (String::from("<em>"), String::from("</em>")));
+        let mut formatter_builder = MatcherBuilder::new(matching_words, tokenizer);
+        formatter_builder.crop_marker(query.crop_marker);
+        formatter_builder.highlight_prefix(query.highlight_pre_tag);
+        formatter_builder.highlight_suffix(query.highlight_post_tag);
 
         let mut documents = Vec::new();
 
         let documents_iter = self.documents(&rtxn, documents_ids)?;
 
         for (_id, obkv) in documents_iter {
-            let mut document = make_document(&to_retrieve_ids, &fields_ids_map, obkv)?;
+            // First generate a document with all the displayed fields
+            let displayed_document = make_document(&displayed_ids, &fields_ids_map, obkv)?;
 
-            let matches_info = query
-                .matches
-                .then(|| compute_matches(&matching_words, &document, &analyzer));
+            // select the attributes to retrieve
+            let attributes_to_retrieve = to_retrieve_ids
+                .iter()
+                .map(|&fid| fields_ids_map.name(fid).expect("Missing field name"));
+            let mut document =
+                permissive_json_pointer::select_values(&displayed_document, attributes_to_retrieve);
 
-            let formatted = format_fields(
+            let (matches_position, formatted) = format_fields(
+                &displayed_document,
                 &fields_ids_map,
-                obkv,
-                &formatter,
-                &matching_words,
+                &formatter_builder,
                 &formatted_options,
+                query.show_matches_position,
+                &displayed_ids,
             )?;
 
             if let Some(sort) = query.sort.as_ref() {
@@ -211,38 +246,40 @@ impl Index {
             let hit = SearchHit {
                 document,
                 formatted,
-                matches_info,
+                matches_position,
             };
             documents.push(hit);
         }
 
-        let nb_hits = candidates.len();
+        let estimated_total_hits = candidates.len();
 
-        let facets_distribution = match query.facets_distribution {
+        let facet_distribution = match query.facets {
             Some(ref fields) => {
-                let mut facets_distribution = self.facets_distribution(&rtxn);
+                let mut facet_distribution = self.facets_distribution(&rtxn);
+
+                let max_values_by_facet = self
+                    .max_values_per_facet(&rtxn)?
+                    .unwrap_or(DEFAULT_VALUES_PER_FACET);
+                facet_distribution.max_values_per_facet(max_values_by_facet);
+
                 if fields.iter().all(|f| f != "*") {
-                    facets_distribution.facets(fields);
+                    facet_distribution.facets(fields);
                 }
-                let distribution = facets_distribution.candidates(candidates).execute()?;
+                let distribution = facet_distribution.candidates(candidates).execute()?;
 
                 Some(distribution)
             }
             None => None,
         };
 
-        let exhaustive_facets_count = facets_distribution.as_ref().map(|_| false); // not implemented yet
-
         let result = SearchResult {
-            exhaustive_nb_hits: false, // not implemented yet
             hits: documents,
-            nb_hits,
+            estimated_total_hits,
             query: query.q.clone().unwrap_or_default(),
             limit: query.limit,
             offset: query.offset.unwrap_or_default(),
             processing_time_ms: before_search.elapsed().as_millis(),
-            facets_distribution,
-            exhaustive_facets_count,
+            facet_distribution,
         };
         Ok(result)
     }
@@ -264,53 +301,6 @@ fn insert_geo_distance(sorts: &[String], document: &mut Document) {
             let distance = milli::distance_between_two_points(&base, &[lat, lng]);
             document.insert("_geoDistance".to_string(), json!(distance.round() as usize));
         }
-    }
-}
-
-fn compute_matches<A: AsRef<[u8]>>(
-    matcher: &impl Matcher,
-    document: &Document,
-    analyzer: &Analyzer<A>,
-) -> MatchesInfo {
-    let mut matches = BTreeMap::new();
-
-    for (key, value) in document {
-        let mut infos = Vec::new();
-        compute_value_matches(&mut infos, value, matcher, analyzer);
-        if !infos.is_empty() {
-            matches.insert(key.clone(), infos);
-        }
-    }
-    matches
-}
-
-fn compute_value_matches<'a, A: AsRef<[u8]>>(
-    infos: &mut Vec<MatchInfo>,
-    value: &Value,
-    matcher: &impl Matcher,
-    analyzer: &Analyzer<'a, A>,
-) {
-    match value {
-        Value::String(s) => {
-            let analyzed = analyzer.analyze(s);
-            let mut start = 0;
-            for (word, token) in analyzed.reconstruct() {
-                if token.is_word() {
-                    if let Some(length) = matcher.matches(token.text()) {
-                        infos.push(MatchInfo { start, length });
-                    }
-                }
-
-                start += word.len();
-            }
-        }
-        Value::Array(vals) => vals
-            .iter()
-            .for_each(|val| compute_value_matches(infos, val, matcher, analyzer)),
-        Value::Object(vals) => vals
-            .values()
-            .for_each(|val| compute_value_matches(infos, val, matcher, analyzer)),
-        _ => (),
     }
 }
 
@@ -430,243 +420,189 @@ fn add_non_formatted_ids_to_formatted_options(
 }
 
 fn make_document(
-    attributes_to_retrieve: &BTreeSet<FieldId>,
+    displayed_attributes: &BTreeSet<FieldId>,
     field_ids_map: &FieldsIdsMap,
     obkv: obkv::KvReaderU16,
 ) -> Result<Document> {
-    let mut document = Document::new();
+    let mut document = serde_json::Map::new();
 
-    for attr in attributes_to_retrieve {
-        if let Some(value) = obkv.get(*attr) {
-            let value = serde_json::from_slice(value)?;
+    // recreate the original json
+    for (key, value) in obkv.iter() {
+        let value = serde_json::from_slice(value)?;
+        let key = field_ids_map
+            .name(key)
+            .expect("Missing field name")
+            .to_string();
 
-            // This unwrap must be safe since we got the ids from the fields_ids_map just
-            // before.
-            let key = field_ids_map
-                .name(*attr)
-                .expect("Missing field name")
-                .to_string();
-
-            document.insert(key, value);
-        }
+        document.insert(key, value);
     }
+
+    // select the attributes to retrieve
+    let displayed_attributes = displayed_attributes
+        .iter()
+        .map(|&fid| field_ids_map.name(fid).expect("Missing field name"));
+
+    let document = permissive_json_pointer::select_values(&document, displayed_attributes);
     Ok(document)
 }
 
-fn format_fields<A: AsRef<[u8]>>(
+fn format_fields<'a, A: AsRef<[u8]>>(
+    document: &Document,
     field_ids_map: &FieldsIdsMap,
-    obkv: obkv::KvReaderU16,
-    formatter: &Formatter<A>,
-    matching_words: &impl Matcher,
+    builder: &MatcherBuilder<'a, A>,
     formatted_options: &BTreeMap<FieldId, FormatOptions>,
-) -> Result<Document> {
-    let mut document = Document::new();
+    compute_matches: bool,
+    displayable_ids: &BTreeSet<FieldId>,
+) -> Result<(Option<MatchesPosition>, Document)> {
+    let mut matches_position = compute_matches.then(BTreeMap::new);
+    let mut document = document.clone();
 
-    for (id, format) in formatted_options {
-        if let Some(value) = obkv.get(*id) {
-            let mut value: Value = serde_json::from_slice(value)?;
+    // select the attributes to retrieve
+    let displayable_names = displayable_ids
+        .iter()
+        .map(|&fid| field_ids_map.name(fid).expect("Missing field name"));
+    permissive_json_pointer::map_leaf_values(&mut document, displayable_names, |key, value| {
+        // To get the formatting option of each key we need to see all the rules that applies
+        // to the value and merge them together. eg. If a user said he wanted to highlight `doggo`
+        // and crop `doggo.name`. `doggo.name` needs to be highlighted + cropped while `doggo.age` is only
+        // highlighted.
+        let format = formatted_options
+            .iter()
+            .filter(|(field, _option)| {
+                let name = field_ids_map.name(**field).unwrap();
+                milli::is_faceted_by(name, key) || milli::is_faceted_by(key, name)
+            })
+            .map(|(_, option)| *option)
+            .reduce(|acc, option| acc.merge(option));
+        let mut infos = Vec::new();
 
-            value = formatter.format_value(value, matching_words, *format);
+        *value = format_value(
+            std::mem::take(value),
+            builder,
+            format,
+            &mut infos,
+            compute_matches,
+        );
 
-            // This unwrap must be safe since we got the ids from the fields_ids_map just
-            // before.
-            let key = field_ids_map
-                .name(*id)
-                .expect("Missing field name")
-                .to_string();
-
-            document.insert(key, value);
-        }
-    }
-
-    Ok(document)
-}
-
-/// trait to allow unit testing of `format_fields`
-trait Matcher {
-    fn matches(&self, w: &str) -> Option<usize>;
-}
-
-#[cfg(test)]
-impl Matcher for BTreeMap<&str, Option<usize>> {
-    fn matches(&self, w: &str) -> Option<usize> {
-        self.get(w).cloned().flatten()
-    }
-}
-
-impl Matcher for MatchingWords {
-    fn matches(&self, w: &str) -> Option<usize> {
-        self.matching_bytes(w)
-    }
-}
-
-struct Formatter<'a, A> {
-    analyzer: &'a Analyzer<'a, A>,
-    marks: (String, String),
-}
-
-impl<'a, A: AsRef<[u8]>> Formatter<'a, A> {
-    pub fn new(analyzer: &'a Analyzer<'a, A>, marks: (String, String)) -> Self {
-        Self { analyzer, marks }
-    }
-
-    fn format_value(
-        &self,
-        value: Value,
-        matcher: &impl Matcher,
-        format_options: FormatOptions,
-    ) -> Value {
-        match value {
-            Value::String(old_string) => {
-                let value = self.format_string(old_string, matcher, format_options);
-                Value::String(value)
+        if let Some(matches) = matches_position.as_mut() {
+            if !infos.is_empty() {
+                matches.insert(key.to_owned(), infos);
             }
-            Value::Array(values) => Value::Array(
-                values
-                    .into_iter()
-                    .map(|v| {
-                        self.format_value(
+        }
+    });
+
+    let selectors = formatted_options
+        .keys()
+        // This unwrap must be safe since we got the ids from the fields_ids_map just
+        // before.
+        .map(|&fid| field_ids_map.name(fid).unwrap());
+    let document = permissive_json_pointer::select_values(&document, selectors);
+
+    Ok((matches_position, document))
+}
+
+fn format_value<'a, A: AsRef<[u8]>>(
+    value: Value,
+    builder: &MatcherBuilder<'a, A>,
+    format_options: Option<FormatOptions>,
+    infos: &mut Vec<MatchBounds>,
+    compute_matches: bool,
+) -> Value {
+    match value {
+        Value::String(old_string) => {
+            let mut matcher = builder.build(&old_string);
+            if compute_matches {
+                let matches = matcher.matches();
+                infos.extend_from_slice(&matches[..]);
+            }
+
+            match format_options {
+                Some(format_options) => {
+                    let value = matcher.format(format_options);
+                    Value::String(value.into_owned())
+                }
+                None => Value::String(old_string),
+            }
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|v| {
+                    format_value(
+                        v,
+                        builder,
+                        format_options.map(|format_options| FormatOptions {
+                            highlight: format_options.highlight,
+                            crop: None,
+                        }),
+                        infos,
+                        compute_matches,
+                    )
+                })
+                .collect(),
+        ),
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        format_value(
                             v,
-                            matcher,
-                            FormatOptions {
+                            builder,
+                            format_options.map(|format_options| FormatOptions {
                                 highlight: format_options.highlight,
                                 crop: None,
-                            },
-                        )
-                    })
-                    .collect(),
-            ),
-            Value::Object(object) => Value::Object(
-                object
-                    .into_iter()
-                    .map(|(k, v)| {
-                        (
-                            k,
-                            self.format_value(
-                                v,
-                                matcher,
-                                FormatOptions {
-                                    highlight: format_options.highlight,
-                                    crop: None,
-                                },
-                            ),
-                        )
-                    })
-                    .collect(),
-            ),
-            value => value,
+                            }),
+                            infos,
+                            compute_matches,
+                        ),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Number(number) => {
+            let s = number.to_string();
+
+            let mut matcher = builder.build(&s);
+            if compute_matches {
+                let matches = matcher.matches();
+                infos.extend_from_slice(&matches[..]);
+            }
+
+            match format_options {
+                Some(format_options) => {
+                    let value = matcher.format(format_options);
+                    Value::String(value.into_owned())
+                }
+                None => Value::Number(number),
+            }
         }
-    }
-
-    fn format_string(
-        &self,
-        s: String,
-        matcher: &impl Matcher,
-        format_options: FormatOptions,
-    ) -> String {
-        let analyzed = self.analyzer.analyze(&s);
-
-        let tokens: Box<dyn Iterator<Item = (&str, Token)>> = match format_options.crop {
-            Some(crop_len) => {
-                let mut buffer = Vec::new();
-                let mut tokens = analyzed.reconstruct().peekable();
-
-                while let Some((word, token)) =
-                    tokens.next_if(|(_, token)| matcher.matches(token.text()).is_none())
-                {
-                    buffer.push((word, token));
-                }
-
-                match tokens.next() {
-                    Some(token) => {
-                        let mut total_len: usize = buffer.iter().map(|(word, _)| word.len()).sum();
-                        let before_iter = buffer.into_iter().skip_while(move |(word, _)| {
-                            total_len -= word.len();
-                            total_len >= crop_len
-                        });
-
-                        let mut taken_after = 0;
-                        let after_iter = tokens.take_while(move |(word, _)| {
-                            let take = taken_after < crop_len;
-                            taken_after += word.chars().count();
-                            take
-                        });
-
-                        let iter = before_iter.chain(Some(token)).chain(after_iter);
-
-                        Box::new(iter)
-                    }
-                    // If no word matches in the attribute
-                    None => {
-                        let mut count = 0;
-                        let iter = buffer.into_iter().take_while(move |(word, _)| {
-                            let take = count < crop_len;
-                            count += word.len();
-                            take
-                        });
-
-                        Box::new(iter)
-                    }
-                }
-            }
-            None => Box::new(analyzed.reconstruct()),
-        };
-
-        tokens.fold(String::new(), |mut out, (word, token)| {
-            // Check if we need to do highlighting or computed matches before calling
-            // Matcher::match since the call is expensive.
-            if format_options.highlight && token.is_word() {
-                if let Some(length) = matcher.matches(token.text()) {
-                    match word.get(..length).zip(word.get(length..)) {
-                        Some((head, tail)) => {
-                            out.push_str(&self.marks.0);
-                            out.push_str(head);
-                            out.push_str(&self.marks.1);
-                            out.push_str(tail);
-                        }
-                        // if we are in the middle of a character
-                        // or if all the word should be highlighted,
-                        // we highlight the complete word.
-                        None => {
-                            out.push_str(&self.marks.0);
-                            out.push_str(word);
-                            out.push_str(&self.marks.1);
-                        }
-                    }
-                    return out;
-                }
-            }
-            out.push_str(word);
-            out
-        })
+        value => value,
     }
 }
 
-fn parse_filter(facets: &Value, index: &Index, txn: &RoTxn) -> Result<Option<FilterCondition>> {
+fn parse_filter(facets: &Value) -> Result<Option<Filter>> {
     match facets {
         Value::String(expr) => {
-            let condition = FilterCondition::from_str(txn, index, expr)?;
-            Ok(Some(condition))
+            let condition = Filter::from_str(expr)?;
+            Ok(condition)
         }
-        Value::Array(arr) => parse_filter_array(txn, index, arr),
+        Value::Array(arr) => parse_filter_array(arr),
         v => Err(FacetError::InvalidExpression(&["Array"], v.clone()).into()),
     }
 }
 
-fn parse_filter_array(
-    txn: &RoTxn,
-    index: &Index,
-    arr: &[Value],
-) -> Result<Option<FilterCondition>> {
+fn parse_filter_array(arr: &[Value]) -> Result<Option<Filter>> {
     let mut ands = Vec::new();
     for value in arr {
         match value {
-            Value::String(s) => ands.push(Either::Right(s.clone())),
+            Value::String(s) => ands.push(Either::Right(s.as_str())),
             Value::Array(arr) => {
                 let mut ors = Vec::new();
                 for value in arr {
                     match value {
-                        Value::String(s) => ors.push(s.clone()),
+                        Value::String(s) => ors.push(s.as_str()),
                         v => {
                             return Err(FacetError::InvalidExpression(&["String"], v.clone()).into())
                         }
@@ -682,7 +618,7 @@ fn parse_filter_array(
         }
     }
 
-    Ok(FilterCondition::from_array(txn, index, ands)?)
+    Ok(Filter::from_array(ands)?)
 }
 
 #[cfg(test)]
@@ -690,680 +626,16 @@ mod test {
     use super::*;
 
     #[test]
-    fn no_ids_no_formatted() {
-        let stop_words = fst::Set::default();
-        let mut config = AnalyzerConfig::default();
-        config.stop_words(&stop_words);
-        let analyzer = Analyzer::new(config);
-        let formatter = Formatter::new(&analyzer, (String::from("<em>"), String::from("</em>")));
-
-        let mut fields = FieldsIdsMap::new();
-        let id = fields.insert("test").unwrap();
-
-        let mut buf = Vec::new();
-        let mut obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(id, Value::String("hello".into()).to_string().as_bytes())
-            .unwrap();
-        obkv.finish().unwrap();
-
-        let obkv = obkv::KvReader::new(&buf);
-
-        let formatted_options = BTreeMap::new();
-
-        let matching_words = MatchingWords::default();
-
-        let value = format_fields(
-            &fields,
-            obkv,
-            &formatter,
-            &matching_words,
-            &formatted_options,
-        )
-        .unwrap();
-
-        assert!(value.is_empty());
-    }
-
-    #[test]
-    fn formatted_with_highlight_in_word() {
-        let stop_words = fst::Set::default();
-        let mut config = AnalyzerConfig::default();
-        config.stop_words(&stop_words);
-        let analyzer = Analyzer::new(config);
-        let formatter = Formatter::new(&analyzer, (String::from("<em>"), String::from("</em>")));
-
-        let mut fields = FieldsIdsMap::new();
-        let title = fields.insert("title").unwrap();
-        let author = fields.insert("author").unwrap();
-
-        let mut buf = Vec::new();
-        let mut obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            title,
-            Value::String("The Hobbit".into()).to_string().as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-        obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            author,
-            Value::String("J. R. R. Tolkien".into())
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-
-        let obkv = obkv::KvReader::new(&buf);
-
-        let mut formatted_options = BTreeMap::new();
-        formatted_options.insert(
-            title,
-            FormatOptions {
-                highlight: true,
-                crop: None,
-            },
-        );
-        formatted_options.insert(
-            author,
-            FormatOptions {
-                highlight: false,
-                crop: None,
-            },
-        );
-
-        let mut matching_words = BTreeMap::new();
-        matching_words.insert("hobbit", Some(3));
-
-        let value = format_fields(
-            &fields,
-            obkv,
-            &formatter,
-            &matching_words,
-            &formatted_options,
-        )
-        .unwrap();
-
-        assert_eq!(value["title"], "The <em>Hob</em>bit");
-        assert_eq!(value["author"], "J. R. R. Tolkien");
-    }
-
-    /// https://github.com/meilisearch/MeiliSearch/issues/1368
-    #[test]
-    fn formatted_with_highlight_emoji() {
-        let stop_words = fst::Set::default();
-        let mut config = AnalyzerConfig::default();
-        config.stop_words(&stop_words);
-        let analyzer = Analyzer::new(config);
-        let formatter = Formatter::new(&analyzer, (String::from("<em>"), String::from("</em>")));
-
-        let mut fields = FieldsIdsMap::new();
-        let title = fields.insert("title").unwrap();
-        let author = fields.insert("author").unwrap();
-
-        let mut buf = Vec::new();
-        let mut obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            title,
-            Value::String("Go💼od luck.".into()).to_string().as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-        obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            author,
-            Value::String("JacobLey".into()).to_string().as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-
-        let obkv = obkv::KvReader::new(&buf);
-
-        let mut formatted_options = BTreeMap::new();
-        formatted_options.insert(
-            title,
-            FormatOptions {
-                highlight: true,
-                crop: None,
-            },
-        );
-        formatted_options.insert(
-            author,
-            FormatOptions {
-                highlight: false,
-                crop: None,
-            },
-        );
-
-        let mut matching_words = BTreeMap::new();
-        // emojis are deunicoded during tokenization
-        // TODO Tokenizer should remove spaces after deunicode
-        matching_words.insert("gobriefcase od", Some(11));
-
-        let value = format_fields(
-            &fields,
-            obkv,
-            &formatter,
-            &matching_words,
-            &formatted_options,
-        )
-        .unwrap();
-
-        assert_eq!(value["title"], "<em>Go💼od</em> luck.");
-        assert_eq!(value["author"], "JacobLey");
-    }
-
-    #[test]
-    fn formatted_with_highlight_in_unicode_word() {
-        let stop_words = fst::Set::default();
-        let mut config = AnalyzerConfig::default();
-        config.stop_words(&stop_words);
-        let analyzer = Analyzer::new(config);
-        let formatter = Formatter::new(&analyzer, (String::from("<em>"), String::from("</em>")));
-
-        let mut fields = FieldsIdsMap::new();
-        let title = fields.insert("title").unwrap();
-        let author = fields.insert("author").unwrap();
-
-        let mut buf = Vec::new();
-        let mut obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(title, Value::String("étoile".into()).to_string().as_bytes())
-            .unwrap();
-        obkv.finish().unwrap();
-        obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            author,
-            Value::String("J. R. R. Tolkien".into())
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-
-        let obkv = obkv::KvReader::new(&buf);
-
-        let mut formatted_options = BTreeMap::new();
-        formatted_options.insert(
-            title,
-            FormatOptions {
-                highlight: true,
-                crop: None,
-            },
-        );
-        formatted_options.insert(
-            author,
-            FormatOptions {
-                highlight: false,
-                crop: None,
-            },
-        );
-
-        let mut matching_words = BTreeMap::new();
-        matching_words.insert("etoile", Some(1));
-
-        let value = format_fields(
-            &fields,
-            obkv,
-            &formatter,
-            &matching_words,
-            &formatted_options,
-        )
-        .unwrap();
-
-        assert_eq!(value["title"], "<em>étoile</em>");
-        assert_eq!(value["author"], "J. R. R. Tolkien");
-    }
-
-    #[test]
-    fn formatted_with_crop_2() {
-        let stop_words = fst::Set::default();
-        let mut config = AnalyzerConfig::default();
-        config.stop_words(&stop_words);
-        let analyzer = Analyzer::new(config);
-        let formatter = Formatter::new(&analyzer, (String::from("<em>"), String::from("</em>")));
-
-        let mut fields = FieldsIdsMap::new();
-        let title = fields.insert("title").unwrap();
-        let author = fields.insert("author").unwrap();
-
-        let mut buf = Vec::new();
-        let mut obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            title,
-            Value::String("Harry Potter and the Half-Blood Prince".into())
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-        obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            author,
-            Value::String("J. K. Rowling".into()).to_string().as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-
-        let obkv = obkv::KvReader::new(&buf);
-
-        let mut formatted_options = BTreeMap::new();
-        formatted_options.insert(
-            title,
-            FormatOptions {
-                highlight: false,
-                crop: Some(2),
-            },
-        );
-        formatted_options.insert(
-            author,
-            FormatOptions {
-                highlight: false,
-                crop: None,
-            },
-        );
-
-        let mut matching_words = BTreeMap::new();
-        matching_words.insert("potter", Some(6));
-
-        let value = format_fields(
-            &fields,
-            obkv,
-            &formatter,
-            &matching_words,
-            &formatted_options,
-        )
-        .unwrap();
-
-        assert_eq!(value["title"], "Harry Potter and");
-        assert_eq!(value["author"], "J. K. Rowling");
-    }
-
-    #[test]
-    fn formatted_with_crop_10() {
-        let stop_words = fst::Set::default();
-        let mut config = AnalyzerConfig::default();
-        config.stop_words(&stop_words);
-        let analyzer = Analyzer::new(config);
-        let formatter = Formatter::new(&analyzer, (String::from("<em>"), String::from("</em>")));
-
-        let mut fields = FieldsIdsMap::new();
-        let title = fields.insert("title").unwrap();
-        let author = fields.insert("author").unwrap();
-
-        let mut buf = Vec::new();
-        let mut obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            title,
-            Value::String("Harry Potter and the Half-Blood Prince".into())
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-        obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            author,
-            Value::String("J. K. Rowling".into()).to_string().as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-
-        let obkv = obkv::KvReader::new(&buf);
-
-        let mut formatted_options = BTreeMap::new();
-        formatted_options.insert(
-            title,
-            FormatOptions {
-                highlight: false,
-                crop: Some(10),
-            },
-        );
-        formatted_options.insert(
-            author,
-            FormatOptions {
-                highlight: false,
-                crop: None,
-            },
-        );
-
-        let mut matching_words = BTreeMap::new();
-        matching_words.insert("potter", Some(6));
-
-        let value = format_fields(
-            &fields,
-            obkv,
-            &formatter,
-            &matching_words,
-            &formatted_options,
-        )
-        .unwrap();
-
-        assert_eq!(value["title"], "Harry Potter and the Half");
-        assert_eq!(value["author"], "J. K. Rowling");
-    }
-
-    #[test]
-    fn formatted_with_crop_0() {
-        let stop_words = fst::Set::default();
-        let mut config = AnalyzerConfig::default();
-        config.stop_words(&stop_words);
-        let analyzer = Analyzer::new(config);
-        let formatter = Formatter::new(&analyzer, (String::from("<em>"), String::from("</em>")));
-
-        let mut fields = FieldsIdsMap::new();
-        let title = fields.insert("title").unwrap();
-        let author = fields.insert("author").unwrap();
-
-        let mut buf = Vec::new();
-        let mut obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            title,
-            Value::String("Harry Potter and the Half-Blood Prince".into())
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-        obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            author,
-            Value::String("J. K. Rowling".into()).to_string().as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-
-        let obkv = obkv::KvReader::new(&buf);
-
-        let mut formatted_options = BTreeMap::new();
-        formatted_options.insert(
-            title,
-            FormatOptions {
-                highlight: false,
-                crop: Some(0),
-            },
-        );
-        formatted_options.insert(
-            author,
-            FormatOptions {
-                highlight: false,
-                crop: None,
-            },
-        );
-
-        let mut matching_words = BTreeMap::new();
-        matching_words.insert("potter", Some(6));
-
-        let value = format_fields(
-            &fields,
-            obkv,
-            &formatter,
-            &matching_words,
-            &formatted_options,
-        )
-        .unwrap();
-
-        assert_eq!(value["title"], "Potter");
-        assert_eq!(value["author"], "J. K. Rowling");
-    }
-
-    #[test]
-    fn formatted_with_crop_and_no_match() {
-        let stop_words = fst::Set::default();
-        let mut config = AnalyzerConfig::default();
-        config.stop_words(&stop_words);
-        let analyzer = Analyzer::new(config);
-        let formatter = Formatter::new(&analyzer, (String::from("<em>"), String::from("</em>")));
-
-        let mut fields = FieldsIdsMap::new();
-        let title = fields.insert("title").unwrap();
-        let author = fields.insert("author").unwrap();
-
-        let mut buf = Vec::new();
-        let mut obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            title,
-            Value::String("Harry Potter and the Half-Blood Prince".into())
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-        obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            author,
-            Value::String("J. K. Rowling".into()).to_string().as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-
-        let obkv = obkv::KvReader::new(&buf);
-
-        let mut formatted_options = BTreeMap::new();
-        formatted_options.insert(
-            title,
-            FormatOptions {
-                highlight: false,
-                crop: Some(6),
-            },
-        );
-        formatted_options.insert(
-            author,
-            FormatOptions {
-                highlight: false,
-                crop: Some(20),
-            },
-        );
-
-        let mut matching_words = BTreeMap::new();
-        matching_words.insert("rowling", Some(3));
-
-        let value = format_fields(
-            &fields,
-            obkv,
-            &formatter,
-            &matching_words,
-            &formatted_options,
-        )
-        .unwrap();
-
-        assert_eq!(value["title"], "Harry ");
-        assert_eq!(value["author"], "J. K. Rowling");
-    }
-
-    #[test]
-    fn formatted_with_crop_and_highlight() {
-        let stop_words = fst::Set::default();
-        let mut config = AnalyzerConfig::default();
-        config.stop_words(&stop_words);
-        let analyzer = Analyzer::new(config);
-        let formatter = Formatter::new(&analyzer, (String::from("<em>"), String::from("</em>")));
-
-        let mut fields = FieldsIdsMap::new();
-        let title = fields.insert("title").unwrap();
-        let author = fields.insert("author").unwrap();
-
-        let mut buf = Vec::new();
-        let mut obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            title,
-            Value::String("Harry Potter and the Half-Blood Prince".into())
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-        obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            author,
-            Value::String("J. K. Rowling".into()).to_string().as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-
-        let obkv = obkv::KvReader::new(&buf);
-
-        let mut formatted_options = BTreeMap::new();
-        formatted_options.insert(
-            title,
-            FormatOptions {
-                highlight: true,
-                crop: Some(1),
-            },
-        );
-        formatted_options.insert(
-            author,
-            FormatOptions {
-                highlight: false,
-                crop: None,
-            },
-        );
-
-        let mut matching_words = BTreeMap::new();
-        matching_words.insert("and", Some(3));
-
-        let value = format_fields(
-            &fields,
-            obkv,
-            &formatter,
-            &matching_words,
-            &formatted_options,
-        )
-        .unwrap();
-
-        assert_eq!(value["title"], " <em>and</em> ");
-        assert_eq!(value["author"], "J. K. Rowling");
-    }
-
-    #[test]
-    fn formatted_with_crop_and_highlight_in_word() {
-        let stop_words = fst::Set::default();
-        let mut config = AnalyzerConfig::default();
-        config.stop_words(&stop_words);
-        let analyzer = Analyzer::new(config);
-        let formatter = Formatter::new(&analyzer, (String::from("<em>"), String::from("</em>")));
-
-        let mut fields = FieldsIdsMap::new();
-        let title = fields.insert("title").unwrap();
-        let author = fields.insert("author").unwrap();
-
-        let mut buf = Vec::new();
-        let mut obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            title,
-            Value::String("Harry Potter and the Half-Blood Prince".into())
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-        obkv = obkv::KvWriter::new(&mut buf);
-        obkv.insert(
-            author,
-            Value::String("J. K. Rowling".into()).to_string().as_bytes(),
-        )
-        .unwrap();
-        obkv.finish().unwrap();
-
-        let obkv = obkv::KvReader::new(&buf);
-
-        let mut formatted_options = BTreeMap::new();
-        formatted_options.insert(
-            title,
-            FormatOptions {
-                highlight: true,
-                crop: Some(9),
-            },
-        );
-        formatted_options.insert(
-            author,
-            FormatOptions {
-                highlight: false,
-                crop: None,
-            },
-        );
-
-        let mut matching_words = BTreeMap::new();
-        matching_words.insert("blood", Some(3));
-
-        let value = format_fields(
-            &fields,
-            obkv,
-            &formatter,
-            &matching_words,
-            &formatted_options,
-        )
-        .unwrap();
-
-        assert_eq!(value["title"], "the Half-<em>Blo</em>od Prince");
-        assert_eq!(value["author"], "J. K. Rowling");
-    }
-
-    #[test]
-    fn test_compute_value_matches() {
-        let text = "Call me Ishmael. Some years ago—never mind how long precisely—having little or no money in my purse, and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world.";
-        let value = serde_json::json!(text);
-
-        let mut matcher = BTreeMap::new();
-        matcher.insert("ishmael", Some(3));
-        matcher.insert("little", Some(6));
-        matcher.insert("particular", Some(1));
-
-        let stop_words = fst::Set::default();
-        let mut config = AnalyzerConfig::default();
-        config.stop_words(&stop_words);
-        let analyzer = Analyzer::new(config);
-
-        let mut infos = Vec::new();
-
-        compute_value_matches(&mut infos, &value, &matcher, &analyzer);
-
-        let mut infos = infos.into_iter();
-        let crop = |info: MatchInfo| &text[info.start..info.start + info.length];
-
-        assert_eq!(crop(infos.next().unwrap()), "Ish");
-        assert_eq!(crop(infos.next().unwrap()), "little");
-        assert_eq!(crop(infos.next().unwrap()), "p");
-        assert_eq!(crop(infos.next().unwrap()), "little");
-        assert!(infos.next().is_none());
-    }
-
-    #[test]
-    fn test_compute_match() {
-        let value = serde_json::from_str(r#"{
-            "color": "Green",
-            "name": "Lucas Hess",
-            "gender": "male",
-            "address": "412 Losee Terrace, Blairstown, Georgia, 2825",
-            "about": "Mollit ad in exercitation quis Laboris . Anim est ut consequat fugiat duis magna aliquip velit nisi. Commodo eiusmod est consequat proident consectetur aliqua enim fugiat. Aliqua adipisicing laboris elit proident enim veniam laboris mollit. Incididunt fugiat minim ad nostrud deserunt tempor in. Id irure officia labore qui est labore nulla nisi. Magna sit quis tempor esse consectetur amet labore duis aliqua consequat.\r\n"
-  }"#).unwrap();
-        let mut matcher = BTreeMap::new();
-        matcher.insert("green", Some(3));
-        matcher.insert("mollit", Some(6));
-        matcher.insert("laboris", Some(7));
-
-        let stop_words = fst::Set::default();
-        let mut config = AnalyzerConfig::default();
-        config.stop_words(&stop_words);
-        let analyzer = Analyzer::new(config);
-
-        let matches = compute_matches(&matcher, &value, &analyzer);
-        assert_eq!(
-            format!("{:?}", matches),
-            r##"{"about": [MatchInfo { start: 0, length: 6 }, MatchInfo { start: 31, length: 7 }, MatchInfo { start: 191, length: 7 }, MatchInfo { start: 225, length: 7 }, MatchInfo { start: 233, length: 6 }], "color": [MatchInfo { start: 0, length: 3 }]}"##
-        );
-    }
-
-    #[test]
     fn test_insert_geo_distance() {
         let value: Document = serde_json::from_str(
             r#"{
-      "_geo": {
-        "lat": 50.629973371633746,
-        "lng": 3.0569447399419567
-      },
-      "city": "Lille",
-      "id": "1"
-    }"#,
+              "_geo": {
+                "lat": 50.629973371633746,
+                "lng": 3.0569447399419567
+              },
+              "city": "Lille",
+              "id": "1"
+            }"#,
         )
         .unwrap();
 

@@ -1,20 +1,8 @@
 use std::error::Error;
 use std::fmt;
 
-use meilisearch_error::{Code, ErrorCode};
+use meilisearch_types::error::{Code, ErrorCode};
 use milli::UserError;
-
-macro_rules! internal_error {
-    ($target:ty : $($other:path), *) => {
-        $(
-            impl From<$other> for $target {
-                fn from(other: $other) -> Self {
-                    Self::Internal(Box::new(other))
-                }
-            }
-        )*
-    }
-}
 
 #[derive(Debug)]
 pub struct MilliError<'a>(pub &'a milli::Error);
@@ -36,25 +24,30 @@ impl ErrorCode for MilliError<'_> {
                 match error {
                     // TODO: wait for spec for new error codes.
                     UserError::SerdeJson(_)
-                    | UserError::MaxDatabaseSizeReached
-                    | UserError::InvalidDocumentId { .. }
-                    | UserError::InvalidStoreFile
-                    | UserError::NoSpaceLeftOnDevice
-                    | UserError::DocumentLimitReached => Code::Internal,
+                    | UserError::InvalidLmdbOpenOptions
+                    | UserError::DocumentLimitReached
+                    | UserError::AccessingSoftDeletedDocument { .. }
+                    | UserError::UnknownInternalDocumentId { .. } => Code::Internal,
+                    UserError::InvalidStoreFile => Code::InvalidStore,
+                    UserError::NoSpaceLeftOnDevice => Code::NoSpaceLeftOnDevice,
+                    UserError::MaxDatabaseSizeReached => Code::DatabaseSizeLimitReached,
                     UserError::AttributeLimitReached => Code::MaxFieldsLimitExceeded,
                     UserError::InvalidFilter(_) => Code::Filter,
-                    UserError::InvalidFilterAttribute(_) => Code::Filter,
                     UserError::MissingDocumentId { .. } => Code::MissingDocumentId,
+                    UserError::InvalidDocumentId { .. } | UserError::TooManyDocumentIds { .. } => {
+                        Code::InvalidDocumentId
+                    }
                     UserError::MissingPrimaryKey => Code::MissingPrimaryKey,
-                    UserError::PrimaryKeyCannotBeChanged => Code::PrimaryKeyAlreadyPresent,
-                    UserError::PrimaryKeyCannotBeReset => Code::PrimaryKeyAlreadyPresent,
+                    UserError::PrimaryKeyCannotBeChanged(_) => Code::PrimaryKeyAlreadyPresent,
                     UserError::SortRankingRuleMissing => Code::Sort,
-                    UserError::UnknownInternalDocumentId { .. } => Code::DocumentNotFound,
                     UserError::InvalidFacetsDistribution { .. } => Code::BadRequest,
                     UserError::InvalidSortableAttribute { .. } => Code::Sort,
                     UserError::CriterionError(_) => Code::InvalidRankingRule,
                     UserError::InvalidGeoField { .. } => Code::InvalidGeoField,
                     UserError::SortError(_) => Code::Sort,
+                    UserError::InvalidMinTypoWordLenSetting(_, _) => {
+                        Code::InvalidMinWordLengthForTypo
+                    }
                 }
             }
         }

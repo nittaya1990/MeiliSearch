@@ -1,25 +1,22 @@
-use meilisearch_error::{Code, ErrorCode};
+use meilisearch_types::error::{Code, ErrorCode};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthenticationError {
-    #[error("You must have an authorization token")]
+    #[error("The Authorization header is missing. It must use the bearer authorization method.")]
     MissingAuthorizationHeader,
-    #[error("Invalid API key")]
-    InvalidToken(String),
+    #[error("The provided API key is invalid.")]
+    InvalidToken,
     // Triggered on configuration error.
-    #[error("Irretrievable state")]
+    #[error("An internal error has occurred. `Irretrievable state`.")]
     IrretrievableState,
-    #[error("Unknown authentication policy")]
-    UnknownPolicy,
 }
 
 impl ErrorCode for AuthenticationError {
     fn error_code(&self) -> Code {
         match self {
             AuthenticationError::MissingAuthorizationHeader => Code::MissingAuthorizationHeader,
-            AuthenticationError::InvalidToken(_) => Code::InvalidToken,
+            AuthenticationError::InvalidToken => Code::InvalidToken,
             AuthenticationError::IrretrievableState => Code::Internal,
-            AuthenticationError::UnknownPolicy => Code::Internal,
         }
     }
 }

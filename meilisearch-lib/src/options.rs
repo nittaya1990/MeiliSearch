@@ -1,46 +1,101 @@
+use crate::export_to_env_if_not_present;
+
 use core::fmt;
-use std::{ops::Deref, str::FromStr};
+use std::{convert::TryFrom, num::ParseIntError, ops::Deref, str::FromStr};
 
 use byte_unit::{Byte, ByteError};
-use milli::CompressionType;
-use structopt::StructOpt;
+use clap::Parser;
+use milli::update::IndexerConfig;
+use serde::{Deserialize, Serialize};
 use sysinfo::{RefreshKind, System, SystemExt};
 
-#[derive(Debug, Clone, StructOpt)]
+const MEILI_MAX_INDEXING_MEMORY: &str = "MEILI_MAX_INDEXING_MEMORY";
+const MEILI_MAX_INDEXING_THREADS: &str = "MEILI_MAX_INDEXING_THREADS";
+const DISABLE_AUTO_BATCHING: &str = "DISABLE_AUTO_BATCHING";
+const DEFAULT_LOG_EVERY_N: usize = 100000;
+
+#[derive(Debug, Clone, Parser, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct IndexerOpts {
     /// The amount of documents to skip before printing
     /// a log regarding the indexing advancement.
-    #[structopt(long, default_value = "100000")] // 100k
+    #[serde(skip_serializing, default = "default_log_every_n")]
+    #[clap(long, default_value_t = default_log_every_n(), hide = true)] // 100k
     pub log_every_n: usize,
 
     /// Grenad max number of chunks in bytes.
-    #[structopt(long)]
+    #[serde(skip_serializing)]
+    #[clap(long, hide = true)]
     pub max_nb_chunks: Option<usize>,
 
-    /// The maximum amount of memory the indexer will use. It defaults to 2/3
-    /// of the available memory. It is recommended to use something like 80%-90%
-    /// of the available memory, no more.
+    /// The maximum amount of memory the indexer will use.
     ///
     /// In case the engine is unable to retrieve the available memory the engine will
     /// try to use the memory it needs but without real limit, this can lead to
     /// Out-Of-Memory issues and it is recommended to specify the amount of memory to use.
-    #[structopt(long, default_value)]
-    pub max_memory: MaxMemory,
+    #[clap(long, env = MEILI_MAX_INDEXING_MEMORY, default_value_t)]
+    #[serde(default)]
+    pub max_indexing_memory: MaxMemory,
 
-    /// The name of the compression algorithm to use when compressing intermediate
-    /// Grenad chunks while indexing documents.
+    /// The maximum number of threads the indexer will use.
+    /// If the number set is higher than the real number of cores available in the machine,
+    /// it will use the maximum number of available cores.
     ///
-    /// Choosing a fast algorithm will make the indexing faster but may consume more memory.
-    #[structopt(long, default_value = "snappy", possible_values = &["snappy", "zlib", "lz4", "lz4hc", "zstd"])]
-    pub chunk_compression_type: CompressionType,
+    /// It defaults to half of the available threads.
+    #[clap(long, env = MEILI_MAX_INDEXING_THREADS, default_value_t)]
+    #[serde(default)]
+    pub max_indexing_threads: MaxThreads,
+}
 
-    /// The level of compression of the chosen algorithm.
-    #[structopt(long, requires = "chunk-compression-type")]
-    pub chunk_compression_level: Option<u32>,
+#[derive(Debug, Clone, Parser, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct SchedulerConfig {
+    /// The engine will disable task auto-batching,
+    /// and will sequencialy compute each task one by one.
+    #[clap(long, env = DISABLE_AUTO_BATCHING)]
+    #[serde(default)]
+    pub disable_auto_batching: bool,
+}
 
-    /// Number of parallel jobs for indexing, defaults to # of CPUs.
-    #[structopt(long)]
-    pub indexing_jobs: Option<usize>,
+impl IndexerOpts {
+    /// Exports the values to their corresponding env vars if they are not set.
+    pub fn export_to_env(self) {
+        let IndexerOpts {
+            max_indexing_memory,
+            max_indexing_threads,
+            log_every_n: _,
+            max_nb_chunks: _,
+        } = self;
+        if let Some(max_indexing_memory) = max_indexing_memory.0 {
+            export_to_env_if_not_present(
+                MEILI_MAX_INDEXING_MEMORY,
+                max_indexing_memory.to_string(),
+            );
+        }
+        export_to_env_if_not_present(
+            MEILI_MAX_INDEXING_THREADS,
+            max_indexing_threads.0.to_string(),
+        );
+    }
+}
+
+impl TryFrom<&IndexerOpts> for IndexerConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(other: &IndexerOpts) -> Result<Self, Self::Error> {
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(*other.max_indexing_threads)
+            .build()?;
+
+        Ok(Self {
+            log_every_n: Some(other.log_every_n),
+            max_nb_chunks: other.max_nb_chunks,
+            max_memory: other.max_indexing_memory.map(|b| b.get_bytes() as usize),
+            thread_pool: Some(thread_pool),
+            max_positions_per_attributes: None,
+            ..Default::default()
+        })
+    }
 }
 
 impl Default for IndexerOpts {
@@ -48,16 +103,23 @@ impl Default for IndexerOpts {
         Self {
             log_every_n: 100_000,
             max_nb_chunks: None,
-            max_memory: MaxMemory::default(),
-            chunk_compression_type: CompressionType::None,
-            chunk_compression_level: None,
-            indexing_jobs: None,
+            max_indexing_memory: MaxMemory::default(),
+            max_indexing_threads: MaxThreads::default(),
         }
     }
 }
 
+impl SchedulerConfig {
+    pub fn export_to_env(self) {
+        let SchedulerConfig {
+            disable_auto_batching,
+        } = self;
+        export_to_env_if_not_present(DISABLE_AUTO_BATCHING, disable_auto_batching.to_string());
+    }
+}
+
 /// A type used to detect the max memory available and use 2/3 of it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct MaxMemory(Option<Byte>);
 
 impl FromStr for MaxMemory {
@@ -111,4 +173,39 @@ fn total_memory_bytes() -> Option<u64> {
     } else {
         None
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MaxThreads(usize);
+
+impl FromStr for MaxThreads {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        usize::from_str(s).map(Self)
+    }
+}
+
+impl Default for MaxThreads {
+    fn default() -> Self {
+        MaxThreads(num_cpus::get() / 2)
+    }
+}
+
+impl fmt::Display for MaxThreads {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Deref for MaxThreads {
+    type Target = usize;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+fn default_log_every_n() -> usize {
+    DEFAULT_LOG_EVERY_N
 }

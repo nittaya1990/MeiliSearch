@@ -3,13 +3,13 @@ use std::io::{BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::Context;
-use heed::{EnvOpenOptions, RoTxn};
 use indexmap::IndexMap;
-use milli::documents::DocumentBatchReader;
+use milli::documents::DocumentsBatchReader;
+use milli::heed::{EnvOpenOptions, RoTxn};
+use milli::update::{IndexDocumentsConfig, IndexerConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::document_formats::read_ndjson;
-use crate::index::update_handler::UpdateHandler;
 use crate::index::updates::apply_settings_to_builder;
 
 use super::error::Result;
@@ -27,10 +27,8 @@ const DATA_FILE_NAME: &str = "documents.jsonl";
 impl Index {
     pub fn dump(&self, path: impl AsRef<Path>) -> Result<()> {
         // acquire write txn make sure any ongoing write is finished before we start.
-        let txn = self.env.write_txn()?;
-        let path = path
-            .as_ref()
-            .join(format!("indexes/{}", self.uuid.to_string()));
+        let txn = self.write_txn()?;
+        let path = path.as_ref().join(format!("indexes/{}", self.uuid));
 
         create_dir_all(&path)?;
 
@@ -87,7 +85,7 @@ impl Index {
         src: impl AsRef<Path>,
         dst: impl AsRef<Path>,
         size: usize,
-        update_handler: &UpdateHandler,
+        indexer_config: &IndexerConfig,
     ) -> anyhow::Result<()> {
         let dir_name = src
             .as_ref()
@@ -112,8 +110,7 @@ impl Index {
         let mut txn = index.write_txn()?;
 
         // Apply settings first
-        let builder = update_handler.update_builder(0);
-        let mut builder = builder.settings(&mut txn, &index);
+        let mut builder = milli::update::Settings::new(&mut txn, &index, indexer_config);
 
         if let Some(primary_key) = primary_key {
             builder.set_primary_key(primary_key);
@@ -121,30 +118,41 @@ impl Index {
 
         apply_settings_to_builder(&settings, &mut builder);
 
-        builder.execute(|_, _| ())?;
+        builder.execute(|_| ())?;
 
         let document_file_path = src.as_ref().join(DATA_FILE_NAME);
         let reader = BufReader::new(File::open(&document_file_path)?);
 
         let mut tmp_doc_file = tempfile::tempfile()?;
 
-        read_ndjson(reader, &mut tmp_doc_file)?;
+        let empty = match read_ndjson(reader, &mut tmp_doc_file) {
+            // if there was no document in the file it's because the index was empty
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => return Err(e.into()),
+        };
 
-        tmp_doc_file.seek(SeekFrom::Start(0))?;
+        if !empty {
+            tmp_doc_file.seek(SeekFrom::Start(0))?;
 
-        let documents_reader = DocumentBatchReader::from_reader(tmp_doc_file)?;
+            let documents_reader = DocumentsBatchReader::from_reader(tmp_doc_file)?;
 
-        //If the document file is empty, we don't perform the document addition, to prevent
-        //a primary key error to be thrown.
-        if !documents_reader.is_empty() {
-            let builder = update_handler
-                .update_builder(0)
-                .index_documents(&mut txn, &index);
-            builder.execute(documents_reader, |_, _| ())?;
+            //If the document file is empty, we don't perform the document addition, to prevent
+            //a primary key error to be thrown.
+            let config = IndexDocumentsConfig::default();
+            let builder = milli::update::IndexDocuments::new(
+                &mut txn,
+                &index,
+                indexer_config,
+                config,
+                |_| (),
+            )?;
+            let (builder, user_error) = builder.add_documents(documents_reader)?;
+            user_error?;
+            builder.execute()?;
         }
 
         txn.commit()?;
-
         index.prepare_for_closing().wait();
 
         Ok(())
